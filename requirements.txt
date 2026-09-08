@@ -1,0 +1,17 @@
+# Core
+python-telegram-bot>=20.7
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Database
+sqlite3
+
+# Data
+pydantic>=2.5.0
+
+# Async
+aiohttp>=3.9.0
+
+# Optional: for advanced features
+# redis>=5.0.0
+# apscheduler>=3.10.0
