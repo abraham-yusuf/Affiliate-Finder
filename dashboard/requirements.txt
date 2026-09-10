@@ -1,0 +1,9 @@
+# Dashboard-specific requirements
+streamlit>=1.28.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+plotly>=5.17.0
+pandas>=2.1.0
+requests>=2.31.0
+python-jose>=3.3.0
+passlib>=1.7.4
