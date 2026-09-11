@@ -316,7 +316,14 @@ def delete_alert(alert_id: int, user_id: int = None) -> bool:
         return c.rowcount > 0
 
 
-# ===================== PRODUCT CACHE =====================
+def get_alert_by_id(alert_id: int) -> Optional[Dict]:
+    """Get alert by ID"""
+    with get_db() as c:
+        row = c.execute("SELECT * FROM price_alerts WHERE id = ?", (alert_id,)).fetchone()
+        return dict(row) if row else None
+
+
+# ===================== ADMIN / UTILS =====================
 
 def get_cached_product(cache_key: str) -> Optional[Dict]:
     """Get cached product data"""
