@@ -1,17 +1,20 @@
 """
-TikTok Shop Affiliate API Client
+TikTok Shop Affiliate API Client - Async Version
 Documentation: https://partner.tiktokshop.com/documents (Affiliate API)
 """
 import time
 import json
 import hmac
 import hashlib
+import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-import requests
+import httpx
 from src.config import get_config
 
 config = get_config()
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -32,7 +35,7 @@ class TikTokProduct:
 
 
 class TikTokShopAffiliateClient:
-    """TikTok Shop Affiliate API Client"""
+    """TikTok Shop Affiliate API Client - Async Version"""
 
     def __init__(self):
         self.app_key = config.tiktok.app_key
@@ -42,11 +45,66 @@ class TikTokShopAffiliateClient:
         self.api_base = config.tiktok.api_base.rstrip("/")
         self.shop_cipher = config.tiktok.shop_cipher
 
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Content-Type": "application/json",
-            "User-Agent": "AffiliateFinderBot/1.0"
-        })
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create async HTTP client"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(config.network.request_timeout),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "AffiliateFinderBot/1.0"
+                }
+            )
+        return self._client
+
+    async def close(self):
+        """Close the HTTP client"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def refresh_access_token(self) -> bool:
+        """Refresh TikTok Shop access token using refresh token"""
+        if not self.refresh_token:
+            logger.warning("No refresh token available for TikTok Shop")
+            return False
+
+        try:
+            path = "/auth/token/refresh"
+            params = {
+                "app_key": self.app_key,
+                "refresh_token": self.refresh_token,
+                "timestamp": int(time.time()),
+            }
+            sign = self._generate_sign(params, path)
+            params["sign"] = sign
+
+            client = await self._get_client()
+            response = await client.post(
+                f"{self.api_base}{path}",
+                params=params,
+                timeout=httpx.Timeout(config.network.request_timeout)
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code", 0) == 0 and "data" in data:
+                    token_data = data["data"]
+                    self.access_token = token_data.get("access_token", "")
+                    self.refresh_token = token_data.get("refresh_token", self.refresh_token)
+                    # Update config
+                    config.tiktok.access_token = self.access_token
+                    config.tiktok.refresh_token = self.refresh_token
+                    logger.info("TikTok Shop access token refreshed successfully")
+                    return True
+
+            logger.error(f"Failed to refresh TikTok token: {response.text}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error refreshing TikTok token: {e}")
+            return False
 
     def _generate_sign(self, params: Dict, path: str) -> str:
         """Generate HMAC SHA256 signature for TikTok API"""
@@ -68,9 +126,9 @@ class TikTokShopAffiliateClient:
             "access_token": self.access_token,
         }
 
-    def _request(self, method: str, path: str, params: Dict = None,
-                 json_data: Dict = None, retry: int = 0) -> Dict:
-        """Make API request with retry logic"""
+    async def _request(self, method: str, path: str, params: Dict = None,
+                       json_data: Dict = None, retry: int = 0) -> Dict:
+        """Make async API request with retry logic"""
         max_retries = config.network.max_retries
         timeout = config.network.request_timeout
 
@@ -85,39 +143,58 @@ class TikTokShopAffiliateClient:
 
         url = f"{self.api_base}{path}"
 
+        client = await self._get_client()
+
         try:
             if method.upper() == "GET":
-                response = self.session.get(url, params=auth_params, timeout=timeout)
+                response = await client.get(url, params=auth_params, timeout=timeout)
             else:
-                response = self.session.post(url, params=auth_params, json=json_data, timeout=timeout)
+                response = await client.post(url, params=auth_params, json=json_data, timeout=timeout)
 
+            # Handle rate limiting
             if response.status_code == 429:
-                if retry < max_retries:
+                if retry < config.network.max_retries:
                     wait_time = 2 ** retry
-                    time.sleep(wait_time)
-                    return self._request(method, path, params, json_data, retry + 1)
+                    await asyncio.sleep(wait_time)
+                    return await self._request(method, path, params, json_data, retry + 1)
                 raise Exception("Rate limit exceeded")
 
             response.raise_for_status()
             data = response.json()
 
+            # Check for API errors
             if data.get("code", 0) != 0:
                 error_msg = data.get("message", "Unknown error")
                 raise Exception(f"TikTok API Error [{data.get('code')}]: {error_msg}")
 
             return data.get("data", data)
 
-        except requests.exceptions.RequestException as e:
-            if retry < max_retries:
-                time.sleep(2 ** retry)
-                return self._request(method, path, params, json_data, retry + 1)
+        except httpx.RequestError as e:
+            if retry < config.network.max_retries:
+                await asyncio.sleep(2 ** retry)
+                return await self._request(method, path, params, json_data, retry + 1)
             raise Exception(f"Request failed: {str(e)}")
 
-    def search_products(self, keyword: str, page: int = 1, page_size: int = 20,
-                        min_price: float = None, max_price: float = None,
-                        category_id: int = None, sort_by: str = "relevance",
-                        filter_high_commission: bool = True) -> List[Dict]:
-        """Search products via TikTok Shop Affiliate API"""
+    async def search_products(self, keyword: str, page: int = 1, page_size: int = 20,
+                              min_price: float = None, max_price: float = None,
+                              category_id: int = None, sort_by: str = "relevance",
+                              filter_high_commission: bool = True) -> List[Dict]:
+        """
+        Search products via TikTok Shop Affiliate API
+
+        Args:
+            keyword: Search keyword
+            page: Page number (1-based)
+            page_size: Results per page (max 50)
+            min_price: Minimum price in IDR
+            max_price: Maximum price in IDR
+            category_id: Category filter
+            sort_by: relevance, sales, price_asc, price_desc, commission_rate
+            filter_high_commission: Only show products with commission > 1%
+
+        Returns:
+            List of product dicts
+        """
         path = "/affiliate/product/search"
 
         params = {
@@ -127,7 +204,7 @@ class TikTokShopAffiliateClient:
         }
 
         if min_price:
-            params["min_price"] = int(min_price * 100)
+            params["min_price"] = int(min_price * 100)  # TikTok uses cents
         if max_price:
             params["max_price"] = int(max_price * 100)
         if category_id:
@@ -142,7 +219,7 @@ class TikTokShopAffiliateClient:
         }
         params["sort_by"] = sort_map.get(sort_by, "relevance")
 
-        data = self._request("GET", path, params)
+        data = await self._request("GET", path, params)
 
         if not data or "products" not in data:
             return []
@@ -157,14 +234,14 @@ class TikTokShopAffiliateClient:
 
         return products
 
-    def get_product_detail(self, product_ids: List[str]) -> List[Dict]:
+    async def get_product_detail(self, product_ids: List[str]) -> List[Dict]:
         """Get detailed product info"""
         path = "/affiliate/product/detail"
         all_products = []
 
         for chunk in self._chunked(product_ids, 50):
             params = {"product_ids": chunk}
-            data = self._request("GET", path, params)
+            data = await self._request("GET", path, params)
 
             if data and "products" in data:
                 for item in data["products"]:
@@ -174,7 +251,7 @@ class TikTokShopAffiliateClient:
 
         return all_products
 
-    def generate_affiliate_link(self, product_id: str, sub_id: str = "") -> str:
+    async def generate_affiliate_link(self, product_id: str, sub_id: str = "") -> str:
         """Generate affiliate link for a product"""
         path = "/affiliate/link/generate"
 
@@ -182,23 +259,23 @@ class TikTokShopAffiliateClient:
         if sub_id:
             params["sub_id"] = sub_id
 
-        data = self._request("POST", path, json_data=params)
+        data = await self._request("POST", path, json_data=params)
 
         if data and "promotion_url" in data:
             return data["promotion_url"]
         return ""
 
-    def generate_affiliate_links_batch(self, product_ids: List[str], sub_id: str = "") -> Dict[str, str]:
+    async def generate_affiliate_links_batch(self, product_ids: List[str], sub_id: str = "") -> Dict[str, str]:
         """Generate affiliate links for multiple products"""
         path = "/affiliate/link/batch_generate"
-        results = {}
 
+        results = {}
         for chunk in self._chunked(product_ids, 50):
             json_data = {"product_ids": chunk}
             if sub_id:
                 json_data["sub_id"] = sub_id
 
-            data = self._request("POST", path, json_data=json_data)
+            data = await self._request("POST", path, json_data=json_data)
 
             if data and "links" in data:
                 for item in data["links"]:
@@ -206,29 +283,29 @@ class TikTokShopAffiliateClient:
 
         return results
 
-    def get_categories(self) -> List[Dict]:
+    async def get_categories(self) -> List[Dict]:
         """Get product categories"""
         path = "/affiliate/category/list"
-        data = self._request("GET", path)
+        data = await self._request("GET", path)
         return data.get("categories", []) if data else []
 
-    def get_commission_rates(self, category_ids: List[int] = None) -> List[Dict]:
+    async def get_commission_rates(self, category_ids: List[int] = None) -> List[Dict]:
         """Get commission rates by category"""
         path = "/affiliate/commission/rate"
         params = {}
         if category_ids:
             params["category_ids"] = category_ids
-        data = self._request("GET", path, params)
+        data = await self._request("GET", path, params)
         return data.get("rates", []) if data else []
 
-    def get_shop_info(self, shop_ids: List[str]) -> List[Dict]:
+    async def get_shop_info(self, shop_ids: List[str]) -> List[Dict]:
         """Get shop information"""
         path = "/affiliate/shop/detail"
         all_shops = []
 
         for chunk in self._chunked(shop_ids, 50):
             params = {"shop_ids": chunk}
-            data = self._request("GET", path, params)
+            data = await self._request("GET", path, params)
 
             if data and "shops" in data:
                 all_shops.extend(data["shops"])
@@ -273,12 +350,13 @@ class TikTokShopAffiliateClient:
                 "raw_data": item
             }
         except Exception as e:
-            print(f"Error parsing TikTok product: {e}")
+            import logging
+            logging.error(f"Error parsing TikTok product: {e}")
             return None
 
-    def search(self, keyword: str, **kwargs) -> List[Dict]:
+    async def search(self, keyword: str, **kwargs) -> List[Dict]:
         """Alias for search_products"""
-        return self.search_products(keyword, **kwargs)
+        return await self.search_products(keyword, **kwargs)
 
     @staticmethod
     def _chunked(iterable, size):
@@ -286,12 +364,23 @@ class TikTokShopAffiliateClient:
         for i in range(0, len(iterable), size):
             yield iterable[i:i + size]
 
+    async def close(self):
+        """Close the HTTP client"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
 
+
+# For testing
 if __name__ == "__main__":
-    client = TikTokShopAffiliateClient()
-    if client.app_key and client.app_secret:
-        results = client.search_products("gula gmp 1kg", page_size=5)
-        for p in results:
-            print(f"{p['name']} - Rp{p['price']:,.0f} - Commission: {p['commission_rate']}%")
-    else:
-        print("TikTok Shop credentials not configured")
+    import asyncio
+
+    async def test():
+        client = TikTokShopAffiliateClient()
+        if client.app_key and client.app_secret:
+            results = await client.search_products("gula gmp 1kg", page_size=5)
+            for p in results:
+                print(f"{p['name']} - Rp{p['price']:,.0f} - Commission: {p['commission_rate']}%")
+        else:
+            print("TikTok Shop credentials not configured")
+
+    asyncio.run(test())

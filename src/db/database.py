@@ -146,6 +146,47 @@ def init_db():
             )
         """)
 
+        # Auto-post channels (target destinations)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'telegram',  -- telegram|facebook|instagram|x|whatsapp (roadmap)
+                chat_id TEXT NOT NULL,        -- @username or -100... numeric
+                title TEXT,
+                username TEXT,
+                enabled INTEGER DEFAULT 1,
+                auto_post INTEGER DEFAULT 0,  -- auto-post new deals to this channel
+                post_template TEXT,           -- optional custom caption template
+                posts_count INTEGER DEFAULT 0,
+                last_post_at INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # Post history (every post attempt)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER,
+                platform TEXT NOT NULL DEFAULT 'telegram',
+                product_id TEXT,
+                product_platform TEXT,      -- shopee|tiktok
+                product_name TEXT,
+                price REAL,
+                affiliate_url TEXT,
+                message_id INTEGER,         -- Telegram message id (if any)
+                status TEXT DEFAULT 'pending',  -- pending|sent|failed
+                error TEXT,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (channel_id) REFERENCES channels(id)
+            )
+        """)
+
         # Create indexes
         c.execute("CREATE INDEX IF NOT EXISTS idx_search_history_user ON search_history(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_search_history_date ON search_history(created_at)")
@@ -153,6 +194,10 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_price_alerts_active ON price_alerts(is_active)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_price_alerts_product ON price_alerts(product_id, platform)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_product_cache_expires ON product_cache(expires_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_channels_platform ON channels(platform)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_at)")
 
 
 # ===================== USER OPERATIONS =====================
@@ -442,11 +487,168 @@ def cleanup_old_data(days: int = 90) -> Dict[str, int]:
     
     with get_db() as c:
         for table, date_col in [("search_history", "created_at"), 
-                                 ("affiliate_links", "created_at")]:
+                                 ("affiliate_links", "created_at"),
+                                 ("posts", "created_at")]:
             cur = c.execute(f"DELETE FROM {table} WHERE {date_col} < ?", (cutoff,))
             results[table] = cur.rowcount
     
     return results
+
+
+# ===================== CHANNELS (auto-post destinations) =====================
+
+def add_channel(user_id: int, chat_id: str, platform: str = "telegram",
+                title: str = None, username: str = None,
+                auto_post: int = 0, post_template: str = None) -> int:
+    """Add a posting destination. Skips if same user+platform+chat_id exists."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT id FROM channels WHERE user_id = ? AND platform = ? AND chat_id = ?",
+            (user_id, platform, str(chat_id))
+        ).fetchone()
+        if row:
+            c.execute("""UPDATE channels SET title = COALESCE(?, title),
+                         username = COALESCE(?, username), enabled = 1, updated_at = ?
+                         WHERE id = ?""",
+                      (title, username, int(time.time()), row["id"]))
+            return row["id"]
+        cur = c.execute("""INSERT INTO channels
+            (user_id, platform, chat_id, title, username, auto_post, post_template, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, platform, str(chat_id), title, username,
+             1 if auto_post else 0, post_template, int(time.time()), int(time.time())))
+        return cur.lastrowid
+
+
+def list_channels(user_id: int = None, platform: str = None, enabled_only: bool = False) -> List[Dict]:
+    """List channels, optionally filtered."""
+    q = "SELECT * FROM channels WHERE 1=1"
+    args: List[Any] = []
+    if user_id is not None:
+        q += " AND user_id = ?"
+        args.append(user_id)
+    if platform:
+        q += " AND platform = ?"
+        args.append(platform)
+    if enabled_only:
+        q += " AND enabled = 1"
+    q += " ORDER BY id"
+    with get_db() as c:
+        return [dict(r) for r in c.execute(q, args).fetchall()]
+
+
+def get_channel(channel_id: int) -> Optional[Dict]:
+    with get_db() as c:
+        row = c.execute("SELECT * FROM channels WHERE id = ?", (channel_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_channel(channel_id: int, **fields) -> bool:
+    allowed = {"title", "username", "enabled", "auto_post", "post_template"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    updates["updated_at"] = int(time.time())
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with get_db() as c:
+        c.execute(f"UPDATE channels SET {set_clause} WHERE id = ?",
+                  list(updates.values()) + [channel_id])
+    return True
+
+
+def toggle_channel(channel_id: int, field: str = "enabled") -> Optional[int]:
+    """Toggle enabled/auto_post. Returns new value."""
+    if field not in ("enabled", "auto_post"):
+        return None
+    with get_db() as c:
+        row = c.execute(f"SELECT {field} FROM channels WHERE id = ?", (channel_id,)).fetchone()
+        if not row:
+            return None
+        new_val = 0 if row[field] else 1
+        c.execute(f"UPDATE channels SET {field} = ?, updated_at = ? WHERE id = ?",
+                  (new_val, int(time.time()), channel_id))
+        return new_val
+
+
+def delete_channel(channel_id: int) -> bool:
+    with get_db() as c:
+        cur = c.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+        return cur.rowcount > 0
+
+
+def bump_channel_post(channel_id: int) -> bool:
+    with get_db() as c:
+        c.execute("""UPDATE channels SET posts_count = posts_count + 1,
+                     last_post_at = ?, updated_at = ? WHERE id = ?""",
+                  (int(time.time()), int(time.time()), channel_id))
+    return True
+
+
+def auto_post_channels() -> List[Dict]:
+    """Channels with auto_post enabled and enabled=1."""
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT * FROM channels WHERE enabled = 1 AND auto_post = 1 ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ===================== POSTS (history) =====================
+
+def log_post(user_id: int, channel_id: int, platform: str = "telegram",
+             product_id: str = None, product_platform: str = None,
+             product_name: str = None, price: float = None,
+             affiliate_url: str = None, message_id: int = None,
+             status: str = "pending", error: str = None) -> int:
+    with get_db() as c:
+        cur = c.execute("""INSERT INTO posts
+            (user_id, channel_id, platform, product_id, product_platform, product_name,
+             price, affiliate_url, message_id, status, error, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, channel_id, platform, product_id, product_platform, product_name,
+             price, affiliate_url, message_id, status, error, int(time.time())))
+        return cur.lastrowid
+
+
+def update_post(post_id: int, **fields) -> bool:
+    allowed = {"message_id", "status", "error"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    with get_db() as c:
+        c.execute(f"UPDATE posts SET {set_clause} WHERE id = ?",
+                  list(updates.values()) + [post_id])
+    return True
+
+
+def recent_posts(user_id: int = None, limit: int = 20) -> List[Dict]:
+    q = """SELECT p.*, c.title AS channel_title, c.chat_id AS channel_chat_id
+           FROM posts p LEFT JOIN channels c ON p.channel_id = c.id"""
+    args: List[Any] = []
+    if user_id is not None:
+        q += " WHERE p.user_id = ?"
+        args.append(user_id)
+    q += " ORDER BY p.id DESC LIMIT ?"
+    args.append(limit)
+    with get_db() as c:
+        return [dict(r) for r in c.execute(q, args).fetchall()]
+
+
+def post_stats(user_id: int = None) -> Dict:
+    q = "SELECT status, COUNT(*) AS n FROM posts"
+    args: List[Any] = []
+    if user_id is not None:
+        q += " WHERE user_id = ?"
+        args.append(user_id)
+    q += " GROUP BY status"
+    with get_db() as c:
+        rows = c.execute(q, args).fetchall()
+        out = {"sent": 0, "failed": 0, "pending": 0, "total": 0}
+        for r in rows:
+            out[r["status"]] = r["n"]
+            out["total"] += r["n"]
+        return out
 
 
 # Initialize on import

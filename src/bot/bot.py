@@ -4,7 +4,8 @@ Telegram Bot for Affiliate Finder
 import asyncio
 import logging
 from typing import Dict, List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ConversationHandler, ContextTypes, filters
@@ -13,6 +14,7 @@ from telegram.ext import (
 from src.config import get_config
 from src.db import database as db
 from src.platforms import PlatformFactory, format_search_results, format_product_for_display
+from src.bot.rate_limiter import check_rate_limit, check_access, get_rate_limiter, get_access_control
 
 config = get_config()
 
@@ -31,7 +33,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
 
 async def is_admin(user_id: int) -> bool:
     """Check if user is admin"""
@@ -642,10 +643,51 @@ async def generate_affiliate_link(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+# ===================== RATE LIMIT & ACCESS WRAPPERS =====================
+
+async def require_access_and_rate_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Check access and rate limit, send error message if denied"""
+    # Check access
+    allowed, msg = await check_access(update, config)
+    if not allowed:
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(msg)
+        return False
+
+    # Check rate limit
+    allowed, msg = await check_rate_limit(update, config)
+    if not allowed:
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(msg)
+        return False
+
+    return True
+
+
+async def protected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
+    """Wrapper that checks access and rate limit before calling handler"""
+    if not await require_access_and_rate_limit(update, context):
+        return
+    return await handler(update, context)
+
+
+async def protected_message(update: Update, context: ContextTypes.DEFAULT_TYPE, handler):
+    """Wrapper for message handlers with access/rate limit"""
+    if not await require_access_and_rate_limit(update, context):
+        return
+    return await handler(update, context)
+
+
 # ===================== CALLBACK ROUTER =====================
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route callback queries"""
+    if not await require_access_and_rate_limit(update, context):
+        return
     query = update.callback_query
     data = query.data
 
@@ -684,8 +726,296 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await alert_detail(update, context)
     elif data == "help":
         await help_command(update, context)
+    elif data == "channels":
+        await channels_menu(update, context)
+    elif data == "channel_add":
+        return await channel_add_start(update, context)
+    elif data.startswith("ch:"):
+        return await channel_detail(update, context)
+    elif data.startswith("ch_toggle:"):
+        await channel_toggle(update, context)
+    elif data.startswith("ch_test:"):
+        await channel_test(update, context)
+    elif data.startswith("ch_del:"):
+        await channel_delete(update, context)
+    elif data.startswith("ch_stats:"):
+        await channel_stats(update, context)
+    elif data == "help":
+        await help_command(update, context)
     else:
         await query.answer("Fitur belum tersedia", show_alert=True)
+
+
+# ===================== CHANNEL MANAGEMENT =====================
+
+async def channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show channels menu"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    channels = db.list_channels(user_id)
+
+    if not channels:
+        text = (
+            "📡 <b>Channel Management</b>\n\n"
+            "Belum ada channel yang ditambahkan.\n\n"
+            "Tambah channel untuk auto-post deal atau manual post."
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ Tambah Channel", callback_data="channel_add")],
+            [InlineKeyboardButton("« Menu Utama", callback_data="main_menu")]
+        ]
+    else:
+        text = "📡 <b>Channel Management</b>\n\n"
+        keyboard = []
+        for ch in channels:
+            status = "✅" if ch["enabled"] else "🚫"
+            auto = "🤖" if ch["auto_post"] else ""
+            platform_emoji = "📱" if ch["platform"] == "telegram" else "🌐"
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{platform_emoji} {ch['title'] or ch['chat_id']} {status}{auto}",
+                    callback_data=f"ch:{ch['id']}"
+                )
+            ])
+        keyboard.append([
+            InlineKeyboardButton("➕ Tambah Channel", callback_data="channel_add"),
+            InlineKeyboardButton("« Menu Utama", callback_data="main_menu")
+        ])
+
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def channel_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start adding a new channel"""
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["channel_data"] = {"platform": "telegram"}
+    await query.edit_message_text(
+        "➕ <b>Tambah Channel</b>\n\n"
+        "Masukkan <b>chat_id</b> channel/grup:\n"
+        "• Format publik: <code>@username</code>\n"
+        "• Format privat: <code>-1001234567890</code>\n\n"
+        "Contoh: <code>@my_channel</code> atau <code>-1001234567890</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channels")]])
+    )
+    return "CHANNEL_CHAT_ID"
+
+
+async def channel_add_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle chat_id input"""
+    chat_id = update.message.text.strip()
+    context.user_data["channel_data"]["chat_id"] = chat_id
+
+    await update.message.reply_text(
+        f"✅ Chat ID: <code>{chat_id}</code>\n\n"
+        "Masukkan nama channel (ketik '-' untuk skip):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channel_add")]])
+    )
+    return "CHANNEL_NAME"
+
+
+async def channel_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle channel name input"""
+    name = update.message.text.strip() if update.message else None
+    if name and name != "-":
+        context.user_data["channel_data"]["title"] = name
+    else:
+        context.user_data["channel_data"]["title"] = context.user_data["channel_data"]["chat_id"]
+
+    chat_id = context.user_data["channel_data"]["chat_id"]
+
+    await update.message.reply_text(
+        f"✅ Channel: <b>{context.user_data['channel_data']['title']}</b>\n"
+        f"Chat ID: <code>{chat_id}</code>\n\n"
+        "Aktifkan auto-post?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 Auto-post ON", callback_data="ch_autopost:1"),
+             InlineKeyboardButton("📝 Manual only", callback_data="ch_autopost:0")],
+            [InlineKeyboardButton("« Kembali", callback_data="channel_add")]
+        ])
+    )
+    return "CHANNEL_OPTIONS"
+
+
+async def channel_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle channel options (auto-post toggle + save)"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("ch_autopost:"):
+        val = int(data.split(":", 1)[1])
+        context.user_data["channel_data"]["auto_post"] = val
+        await query.answer(f"Auto-post: {'ON' if val else 'OFF'}")
+
+    elif data == "ch_save":
+        cd = context.user_data.get("channel_data", {})
+        cid = db.add_channel(
+            user_id=query.from_user.id,
+            chat_id=cd.get("chat_id"),
+            platform=cd.get("platform", "telegram"),
+            title=cd.get("title"),
+            auto_post=cd.get("auto_post", 0),
+        )
+        await query.edit_message_text(
+            f"✅ Channel <b>{cd.get('title', 'saved')}</b> disimpan!\n\n"
+            f"ID: <code>{cid}</code>\n"
+            f"Auto-post: {'ON' if cd.get('auto_post') else 'OFF'}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channels")]])
+        )
+        return ConversationHandler.END
+
+
+async def channel_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show channel detail and actions"""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = int(query.data.replace("ch:", ""))
+    channel = db.get_channel(channel_id)
+
+    if not channel:
+        await query.edit_message_text(
+            "❌ Channel tidak ditemukan",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channels")]])
+        )
+        return
+
+    status = "✅ Aktif" if channel["enabled"] else "🚫 Nonaktif"
+    auto = "🤖 Auto-post ON" if channel["auto_post"] else "📝 Manual only"
+    platform_emoji = "📱" if channel["platform"] == "telegram" else "🌐"
+
+    text = (
+        f"{platform_emoji} <b>{channel['title'] or channel['chat_id']}</b>\n\n"
+        f"Chat ID: <code>{channel['chat_id']}</code>\n"
+        f"Platform: <b>{channel['platform']}</b>\n"
+        f"Status: {status}\n"
+        f"Auto-post: {auto}\n"
+        f"Posts: <b>{channel['posts_count']}</b>"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'🚫 Nonaktifkan' if channel['enabled'] else '✅ Aktifkan'}",
+            callback_data=f"ch_toggle:{channel['id']}:enabled"
+        ),
+        InlineKeyboardButton(
+            f"{'🤖 Matikan auto' if channel['auto_post'] else '🤖 Aktifkan auto'}",
+            callback_data=f"ch_toggle:{channel['id']}:auto_post"
+        )],
+        [InlineKeyboardButton("🧪 Test Post", callback_data=f"ch_test:{channel['id']}")],
+        [InlineKeyboardButton("🗑️ Hapus", callback_data=f"ch_del:{channel['id']}"),
+         InlineKeyboardButton("« Kembali", callback_data="channels")]
+    ]
+
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def channel_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle enabled/auto_post"""
+    query = update.callback_query
+    await query.answer()
+    _, cid_str, field = query.data.split(":", 2)
+    channel_id = int(cid_str)
+
+    new_val = db.toggle_channel(channel_id, field)
+    await query.answer(f"{field}: {'ON' if new_val else 'OFF'}")
+    await channel_detail(update, context)
+
+
+async def channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send test message to channel"""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = int(query.data.replace("ch_test:", ""))
+    channel = db.get_channel(channel_id)
+
+    if not channel:
+        await query.edit_message_text("❌ Channel tidak ditemukan")
+        return
+
+    await query.edit_message_text("📤 Mengirim test message...")
+
+    from src.publisher import publish_to_channel
+    test_product = {
+        "name": "🧪 Test Message dari Affiliate Finder",
+        "price": 0,
+        "commission_rate": 0,
+        "platform": "telegram",
+    }
+    result = await publish_to_channel(
+        channel["id"], test_product, "https://example.com",
+        query.from_user.id, template="short",
+        bot=context.bot
+    )
+
+    if result.get("ok"):
+        await query.edit_message_text(
+            f"✅ Test berhasil!\nMessage ID: <code>{result.get('message_id')}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data=f"ch:{channel_id}")]])
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ Test gagal: {result.get('error')}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data=f"ch:{channel_id}")]])
+        )
+
+
+async def channel_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete channel"""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = int(query.data.replace("ch_del:", ""))
+    if db.delete_channel(channel_id):
+        await query.edit_message_text(
+            "🗑️ Channel dihapus",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channels")]])
+        )
+    else:
+        await query.edit_message_text(
+            "❌ Gagal hapus",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="channels")]])
+        )
+
+
+async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show channel stats"""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = int(query.data.replace("ch_stats:", ""))
+    stats = db.post_stats(query.from_user.id)
+    channel = db.get_channel(channel_id)
+
+    if not channel:
+        await query.edit_message_text("❌ Channel tidak ditemukan")
+        return
+
+    text = (
+        f"📊 <b>Stats Channel: {channel['title'] or channel['chat_id']}</b>\n\n"
+        f"Total post: <b>{stats.get('total', 0)}</b>\n"
+        f"✅ Terkirim: <b>{stats.get('sent', 0)}</b>\n"
+        f"❌ Gagal: <b>{stats.get('failed', 0)}</b>\n"
+        f"⏳ Pending: <b>{stats.get('pending', 0)}</b>"
+    )
+
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data=f"ch:{channel_id}")]])
+    )
 
 
 # ===================== ERROR HANDLER =====================
@@ -753,12 +1083,36 @@ def create_application() -> Application:
         per_chat=True,
     )
 
+    channel_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(channel_add_start, pattern="^channel_add$"),
+            CallbackQueryHandler(channel_add_name, pattern="^ch_platform:"),
+            CallbackQueryHandler(channel_add_name, pattern="^ch_autopost:"),
+            CallbackQueryHandler(channel_option, pattern="^ch_autopost:"),
+            CallbackQueryHandler(channel_option, pattern="^ch_platform:"),
+            CallbackQueryHandler(channel_option, pattern="^ch_save$"),
+        ],
+        states={
+            "CHANNEL_CHAT_ID": [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_add_chat_id)],
+            "CHANNEL_NAME": [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_add_name)],
+            "CHANNEL_OPTIONS": [
+                CallbackQueryHandler(channel_option, pattern="^ch_platform:"),
+                CallbackQueryHandler(channel_option, pattern="^ch_autopost:"),
+                CallbackQueryHandler(channel_option, pattern="^ch_save$"),
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(start, pattern="^main_menu$")],
+        per_message=False,
+        per_chat=True,
+    )
+
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(search_conv)
     application.add_handler(alert_conv)
     application.add_handler(settings_conv)
+    application.add_handler(channel_conv)
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_error_handler(error_handler)
 
@@ -772,6 +1126,10 @@ async def run_bot():
     # Initialize database
     db.init_db()
 
+    # Start price alert scheduler in background
+    from src.scheduler.price_alerts import start_price_alert_scheduler
+    await start_price_alert_scheduler(bot=application.bot)
+
     logger.info("Starting Affiliate Finder Bot...")
     await application.initialize()
     await application.start()
@@ -783,6 +1141,8 @@ async def run_bot():
     try:
         await asyncio.Event().wait()
     finally:
+        from src.scheduler.price_alerts import stop_price_alert_scheduler
+        await stop_price_alert_scheduler()
         await application.updater.stop_polling()
         await application.stop()
         await application.shutdown()

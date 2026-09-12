@@ -1,12 +1,15 @@
 """
 Platform factory and unified interface for affiliate APIs
 """
+import logging
 from typing import Dict, List, Optional, Any
 from src.config import get_config
 from src.platforms.shopee import ShopeeAffiliateClient
 from src.platforms.tiktok import TikTokShopAffiliateClient
 
 config = get_config()
+
+logger = logging.getLogger(__name__)
 
 
 class PlatformFactory:
@@ -47,7 +50,7 @@ class PlatformFactory:
                 client = cls.get_shopee_client()
                 results["shopee"] = client.search_products(keyword, **kwargs)
             except Exception as e:
-                print(f"Shopee search error: {e}")
+                logger.error(f"Shopee search error: {e}")
                 results["shopee"] = []
 
         if config.tiktok.is_configured:
@@ -55,7 +58,7 @@ class PlatformFactory:
                 client = cls.get_tiktok_client()
                 results["tiktok"] = client.search_products(keyword, **kwargs)
             except Exception as e:
-                print(f"TikTok search error: {e}")
+                logger.error(f"TikTok search error: {e}")
                 results["tiktok"] = []
 
         return results
@@ -68,7 +71,7 @@ class PlatformFactory:
             return client.generate_affiliate_links_batch(item_ids, sub_id)
         elif platform == "tiktok" and config.tiktok.is_configured:
             client = cls.get_tiktok_client()
-            return cls.get_tiktok_client().generate_affiliate_links_batch(platform, item_ids)
+            return client.generate_affiliate_links_batch(item_ids, sub_id)
         return {}
 
     @classmethod
